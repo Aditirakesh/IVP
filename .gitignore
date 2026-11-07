@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+.env
+.DS_Store
+
+# data and run outputs stay local / on Drive, never in git
+data/raw/*
+data/processed/*
+runs/*
+*.pt
+*.npz
+*.edf
+*.pptx
+
+# keep the empty folders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!runs/.gitkeep

@@ -1,0 +1,12 @@
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+mne
+torch>=2.0
+captum
+pytest
+python-pptx
+# optional demo screen (Member 7)
+# gradio
