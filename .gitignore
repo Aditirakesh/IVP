@@ -9,13 +9,19 @@ __pycache__/
 # data and run outputs stay local / on Drive, never in git
 data/raw/*
 data/processed/*
+src/data/raw/*
+src/data/processed/*
 runs/*
 *.pt
 *.npz
 *.edf
+*.mat
+*.zip
 *.pptx
 
 # keep the empty folders
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+!src/data/raw/.gitkeep
+!src/data/processed/.gitkeep
 !runs/.gitkeep
