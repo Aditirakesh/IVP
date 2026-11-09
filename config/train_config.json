@@ -1,0 +1,27 @@
+{
+  "experiment": "cdl_mddnet",
+  "model": "src.models.cdl_mddnet:CDLMDDNet",
+  "protocol": "kfold10",
+  "data_path": null,
+  "runs_dir": "runs",
+  "n_folds": 10,
+  "val_fraction": 0.15,
+  "seed": 42,
+  "split_seed": 0,
+  "epochs": 60,
+  "batch_size": 64,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "optimizer": "adamw",
+  "scheduler": "cosine",
+  "early_stopping_patience": 12,
+  "early_stopping_min_delta": 0.0001,
+  "class_weighted_loss": true,
+  "grad_clip_norm": 1.0,
+  "use_amp": true,
+  "deterministic": true,
+  "device": "auto",
+  "num_workers": 0,
+  "n_classes": 2
+}
+
