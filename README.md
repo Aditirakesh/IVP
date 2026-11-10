@@ -76,9 +76,9 @@ When Member 7 has produced `runs/results.csv`:
 | Stage | Status |
 | --- | --- |
 | Repo, CI, leakage tests, benchmark, results table and slide scripts | done (results table and slides wait for real results) |
-| Data pipeline | not started |
-| Splits and training | not started |
-| Model | not started |
+| Data pipeline | done (Member 2; 53 participants, 4,002 epochs, see reports/preprocessing_report.md) |
+| Splits and training | done (10-fold and LOSO run; results in results/, checkpoints in release v1.0.0) |
+| Model | done (CDLMDDNet merged, 25,627 parameters at 128 channels) |
 | Evaluation | not started |
 | Channel reduction | not started |
 | Interpretability | not started |
