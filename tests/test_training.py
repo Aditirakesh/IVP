@@ -10,11 +10,18 @@ import pytest
 import torch
 from torch import nn
 
+from src.models.cdl_mddnet import CDLMDDNet
 from src.training.config import TrainConfig, build_model, set_seed
-from src.training.run_experiment import parse_fold_selection, run_experiment, select_channels
+from src.training.run_experiment import (
+    main as runner_main,
+    parse_fold_selection,
+    run_experiment,
+    select_channels,
+)
 from src.training.splits import kfold_splits, loso_splits, make_val_split
 from src.training.trainer import (
     EarlyStopping,
+    TRAIN_CKPT_FILENAME,
     _load_checkpoint_into_model,
     _make_loader,
     train_fold,
@@ -29,6 +36,7 @@ def _make_synthetic_npz(
     n_channels: int = 8,
     n_samples: int = 100,
     seed: int = 7,
+    subject_offset: int = 0,
 ) -> Path:
     rng = np.random.default_rng(seed)
     n_subj = n_mdd + n_hc
@@ -38,7 +46,9 @@ def _make_synthetic_npz(
     y = np.repeat(np.array([1] * n_mdd + [0] * n_hc, dtype=np.int64), epochs_per_subj)
     # Give MDD epochs a mild signal offset so training has a real learnable signal
     X[y == 1] += 0.75
-    subject_id = np.repeat(np.arange(n_subj, dtype=np.int64), epochs_per_subj)
+    subject_id = np.repeat(
+        np.arange(subject_offset, subject_offset + n_subj, dtype=np.int64), epochs_per_subj
+    )
     ch_names = np.array([f"E{i+1}" for i in range(n_channels)], dtype="<U8")
 
     np.savez(str(path), X=X, y=y, subject_id=subject_id, ch_names=ch_names)
@@ -101,6 +111,9 @@ class TestConfigAndEarlyStopping:
         assert cfg.protocol == "kfold10"
         assert cfg.n_folds == 10
         assert cfg.seed == 42
+        assert cfg.use_dann is True
+        assert cfg.dann_gamma == 10.0
+        assert cfg.dann_loss_weight == 1.0
 
     def test_early_stopping_triggers_on_plateau(self):
         es = EarlyStopping(patience=2, min_delta=1e-3)
@@ -117,6 +130,7 @@ class TestConfigAndEarlyStopping:
         tr, te = next(kfold_splits(sids, n_folds=4, seed=0, y=y))
         cfg = TrainConfig(
             model="dummy",
+            use_dann=False,
             epochs=3,
             batch_size=8,
             seed=123,
@@ -148,6 +162,7 @@ class TestRunnerAndOutputs:
         cfg = TrainConfig(
             experiment="dummy_kfold",
             model="dummy",
+            use_dann=False,
             protocol="kfold10",
             data_path=str(data_path),
             runs_dir=str(runs_dir),
@@ -221,6 +236,7 @@ class TestRunnerAndOutputs:
         cfg = TrainConfig(
             experiment="dummy_ch3_loso",
             model="dummy",
+            use_dann=False,
             protocol="loso",
             data_path=str(data_path),
             runs_dir=str(tmp_path / "runs"),
@@ -323,7 +339,7 @@ class TestRegressionFixes:
 
         monkeypatch.setattr(
             "src.training.trainer.build_model",
-            lambda model_spec, n_channels, n_samples=1000, n_classes=2: _BatchNormTestNet(
+            lambda model_spec, n_channels, n_samples=1000, n_classes=2, n_subjects=0: _BatchNormTestNet(
                 n_channels, n_samples, n_classes
             ),
         )
@@ -331,6 +347,7 @@ class TestRegressionFixes:
         # Case 1: N % batch_size == 1 (9 % 4 == 1) must not crash BatchNorm1d
         cfg_bn = TrainConfig(
             model="dummy",
+            use_dann=False,
             val_fraction=0.25,
             epochs=2,
             batch_size=4,
@@ -344,6 +361,7 @@ class TestRegressionFixes:
         # Case 2: small dataset (N=9 < batch_size=16) must not discard all training batches
         cfg_small = TrainConfig(
             model="dummy",
+            use_dann=False,
             val_fraction=0.25,
             epochs=2,
             batch_size=16,
@@ -369,12 +387,13 @@ class TestRegressionFixes:
 
         monkeypatch.setattr(
             "src.training.trainer.build_model",
-            lambda model_spec, n_channels, n_samples=1000, n_classes=2: _ControlledValNaNNet(
+            lambda model_spec, n_channels, n_samples=1000, n_classes=2, n_subjects=0: _ControlledValNaNNet(
                 n_channels, fail_from_eval_call=1
             ),
         )
         cfg = TrainConfig(
             model="dummy",
+            use_dann=False,
             val_fraction=0.25,
             epochs=3,
             batch_size=4,
@@ -411,7 +430,7 @@ class TestRegressionFixes:
 
         holders = []
 
-        def _make_net(model_spec, n_channels, n_samples=1000, n_classes=2):
+        def _make_net(model_spec, n_channels, n_samples=1000, n_classes=2, n_subjects=0):
             m = _EvalEpoch2NaNNet(n_channels)
             holders.append(m)
             return m
@@ -419,6 +438,7 @@ class TestRegressionFixes:
         monkeypatch.setattr("src.training.trainer.build_model", _make_net)
         cfg = TrainConfig(
             model="dummy",
+            use_dann=False,
             val_fraction=0.25,
             epochs=5,
             batch_size=8,
@@ -467,6 +487,7 @@ class TestRegressionFixes:
         base_cfg = TrainConfig(
             experiment="safe_resume_exp",
             model="dummy",
+            use_dann=False,
             protocol="kfold10",
             data_path=str(data_a),
             runs_dir=str(runs_dir),
@@ -527,6 +548,7 @@ class TestRegressionFixes:
         cfg = TrainConfig(
             experiment="batched_kfold",
             model="dummy",
+            use_dann=False,
             protocol="kfold10",
             data_path=str(data_path),
             runs_dir=str(runs_dir),
@@ -603,6 +625,11 @@ class TestRegressionFixes:
             {"optimizer": "sgd"},
             {"scheduler": "invalid"},
             {"device": "tpu"},
+            {"use_dann": "true"},
+            {"dann_gamma": -1.0},
+            {"dann_gamma": float("nan")},
+            {"dann_loss_weight": -0.5},
+            {"dann_loss_weight": float("inf")},
         ],
     )
     def test_invalid_config_values_raise_value_error(self, overrides):
@@ -640,7 +667,7 @@ class TestRegressionFixes:
         X = np.zeros((12, 4, 10), dtype=np.float32)
         y = np.array([0, 1, 2] * 4, dtype=np.int64)
         sids = np.repeat(np.arange(6, dtype=np.int64), 2)
-        cfg = TrainConfig(model="dummy", epochs=1, batch_size=4, device="cpu", use_amp=False)
+        cfg = TrainConfig(model="dummy", use_dann=False, epochs=1, batch_size=4, device="cpu", use_amp=False)
         with pytest.raises(ValueError, match="labels in \\{0, 1\\}"):
             train_fold(0, X, y, sids, np.arange(8), np.arange(8, 12), cfg, tmp_path / "bad_y")
 
@@ -663,3 +690,403 @@ class TestRegressionFixes:
         with pytest.raises(ValueError, match="min_delta"):
             EarlyStopping(patience=2, min_delta=-1e-4)
 
+
+class TestDANNIntegration:
+    def test_dann_unsupported_model_fails_explicitly(self, tmp_path):
+        data_path = _make_synthetic_npz(
+            tmp_path / "unsupported.npz", n_mdd=3, n_hc=3, epochs_per_subj=3
+        )
+        cfg = TrainConfig(
+            experiment="dummy_with_dann",
+            model="dummy",
+            use_dann=True,
+            data_path=str(data_path),
+            runs_dir=str(tmp_path / "runs"),
+            n_folds=3,
+            epochs=2,
+            batch_size=8,
+            device="cpu",
+            use_amp=False,
+        )
+        with pytest.raises(ValueError, match="does not accept 'n_subjects'"):
+            run_experiment(cfg, verbose=False)
+
+        with np.load(str(data_path)) as d:
+            X, y, sids = d["X"], d["y"], d["subject_id"]
+        tr, te = next(kfold_splits(sids, n_folds=3, seed=0, y=y))
+        with pytest.raises(ValueError, match="does not accept 'n_subjects'"):
+            train_fold(0, X, y, sids, tr, te, cfg, tmp_path / "fold_err")
+
+        with pytest.raises(ValueError, match="does not accept 'n_subjects'"):
+            runner_main([
+                "--model", "dummy",
+                "--use-dann",
+                "--data", str(data_path),
+                "--runs-dir", str(tmp_path / "runs"),
+            ])
+
+        class _AcceptsNSubjectsNoForwardTrain(nn.Module):
+            def __init__(self, n_channels: int, n_samples: int, n_classes: int = 2, n_subjects: int = 0) -> None:
+                super().__init__()
+                self.fc = nn.Linear(n_channels, n_classes)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.fc(x.mean(dim=-1))
+
+        # Test second check: accepts n_subjects in __init__, but lacks forward_train(x, lambd)
+        import src.training.config as cfg_mod
+
+        orig_loader = cfg_mod.load_model_class
+        try:
+            cfg_mod.load_model_class = lambda spec: _AcceptsNSubjectsNoForwardTrain
+            with pytest.raises(ValueError, match="forward_train"):
+                build_model("custom:NoForwardTrain", n_channels=8, n_samples=32, n_subjects=4)
+        finally:
+            cfg_mod.load_model_class = orig_loader
+
+    def test_dann_active_losses_gradient_reversal_and_val_test_exclusion(self, tmp_path, monkeypatch):
+        data_path = _make_synthetic_npz(
+            tmp_path / "dann_active.npz",
+            n_mdd=5,
+            n_hc=5,
+            epochs_per_subj=4,
+            n_channels=16,
+            n_samples=64,
+            subject_offset=2010002,
+        )
+        with np.load(str(data_path)) as d:
+            X, y, sids = d["X"], d["y"], d["subject_id"]
+
+        tr, te = next(kfold_splits(sids, n_folds=5, seed=0, y=y))
+        cfg = TrainConfig(
+            model="src.models.cdl_mddnet:CDLMDDNet",
+            use_dann=True,
+            dann_gamma=10.0,
+            dann_loss_weight=1.0,
+            val_fraction=0.25,
+            epochs=3,
+            batch_size=8,
+            lr=1e-2,
+            seed=77,
+            device="cpu",
+            use_amp=False,
+        )
+
+        # Capture initial weights with identical seed/fold_seed and n_subjects=len(sub_train)
+        sub_tr, _ = make_val_split(tr, sids, y=y, val_fraction=0.25, seed=77)
+        k_train = int(len(np.unique(sids[sub_tr])))
+        set_seed(77, deterministic=cfg.deterministic)
+        init_model = CDLMDDNet(n_channels=16, n_samples=64, n_classes=2, n_subjects=k_train)
+        init_subj_w = init_model.subject_head[0].weight.detach().clone()
+        init_spatial_w = init_model.spatial[0].weight.detach().clone()
+
+        orig_forward = CDLMDDNet.forward
+        orig_forward_train = CDLMDDNet.forward_train
+        train_calls = []
+        eval_calls = []
+
+        def _spy_forward_train(self, xb, lambd=1.0):
+            cls_l, subj_l = orig_forward_train(self, xb, lambd=lambd)
+            train_calls.append((bool(self.training), float(lambd), tuple(subj_l.shape)))
+            return cls_l, subj_l
+
+        def _spy_forward(self, xb):
+            out = orig_forward(self, xb)
+            eval_calls.append((bool(self.training), tuple(out.shape)))
+            return out
+
+        monkeypatch.setattr(CDLMDDNet, "forward_train", _spy_forward_train)
+        monkeypatch.setattr(CDLMDDNet, "forward", _spy_forward)
+
+        fold_dir = tmp_path / "fold_dann_active"
+        ep_records = []
+        summary = train_fold(
+            0, X, y, sids, tr, te, cfg, fold_dir, epoch_callback=ep_records.append
+        )
+
+        # 1. forward_train called ONLY during training, forward ONLY during eval/test
+        assert len(train_calls) >= 3
+        assert all(is_train is True for is_train, _, _ in train_calls)
+        assert all(lambd > 0.0 for _, lambd, _ in train_calls)
+        assert all(shape[1] == k_train for _, _, shape in train_calls)
+        assert len(eval_calls) >= 4  # >= 3 val epochs + 1 test eval
+        assert all(is_train is False for is_train, _ in eval_calls)
+
+        # 2. Both classification and subject losses logged and combined accurately
+        assert len(ep_records) == 3
+        for rec in ep_records:
+            assert rec["train_cls_loss"] > 0.0
+            assert rec["train_subj_loss"] is not None and rec["train_subj_loss"] > 0.0
+            assert rec["dann_lambda"] is not None and rec["dann_lambda"] > 0.0
+            expected_total = rec["train_cls_loss"] + cfg.dann_loss_weight * rec["train_subj_loss"]
+            assert abs(rec["train_loss"] - expected_total) < 1e-4
+
+        with open(fold_dir / "train_log.csv", newline="", encoding="utf-8") as f:
+            log_rows = list(csv.DictReader(f))
+        assert len(log_rows) == 3
+        assert all(float(r["train_subj_loss"]) > 0.0 for r in log_rows)
+        assert all(float(r["dann_lambda"]) > 0.0 for r in log_rows)
+
+        # 3. Subject head and encoder actually updated by optimization
+        train_ckpt = torch.load(
+            fold_dir / TRAIN_CKPT_FILENAME, map_location="cpu", weights_only=True
+        )
+        trained_subj_w = train_ckpt["model_state_dict"]["subject_head.0.weight"]
+        trained_spatial_w = train_ckpt["model_state_dict"]["spatial.0.weight"]
+        assert not torch.allclose(init_subj_w, trained_subj_w)
+        assert not torch.allclose(init_spatial_w, trained_spatial_w)
+
+        # 4. Verify inference checkpoint strictly matches standard CDLMDDNet(n_channels, n_samples, n_classes)
+        inf_state = torch.load(fold_dir / "model.pt", map_location="cpu", weights_only=True)
+        assert not any(k.startswith("subject_head.") for k in inf_state)
+        inf_model = CDLMDDNet(n_channels=16, n_samples=64, n_classes=2)
+        inf_model.load_state_dict(inf_state, strict=True)
+        assert summary["use_dann"] is True
+        assert summary["n_train_subjects"] == k_train
+
+    def test_dann_per_fold_remapping_no_leakage_and_checkpoints_10fold_loso(self, tmp_path):
+        # 10 subjects (5 MDD, 5 HC) with MODMA-like IDs for 10-fold CV with real CDLMDDNet
+        data_10 = _make_synthetic_npz(
+            tmp_path / "modma_10subj.npz",
+            n_mdd=5,
+            n_hc=5,
+            epochs_per_subj=4,
+            n_channels=16,
+            n_samples=64,
+            subject_offset=2010002,
+        )
+        runs_dir = tmp_path / "runs"
+        cfg_10 = TrainConfig(
+            experiment="cdl_dann_10fold",
+            model="src.models.cdl_mddnet:CDLMDDNet",
+            protocol="kfold10",
+            use_dann=True,
+            dann_gamma=10.0,
+            dann_loss_weight=1.0,
+            data_path=str(data_10),
+            runs_dir=str(runs_dir),
+            n_folds=10,
+            val_fraction=0.2,
+            epochs=4,
+            early_stopping_patience=2,
+            batch_size=8,
+            device="cpu",
+            use_amp=False,
+        )
+        res_10 = run_experiment(cfg_10, verbose=False)
+        assert len(res_10["folds"]) == 10
+
+        seen_epochs = set()
+        fold_subject_maps = []
+        for k in range(10):
+            fdir = runs_dir / "cdl_dann_10fold" / f"fold_{k}"
+            meta = json.loads((fdir / "fold_meta.json").read_text(encoding="utf-8"))
+            assert meta["use_dann"] is True
+            assert meta["dann_gamma"] == 10.0
+            assert meta["dann_loss_weight"] == 1.0
+            tr_s = set(meta["train_subjects"])
+            va_s = set(meta["val_subjects"])
+            te_s = set(meta["test_subjects"])
+            assert tr_s.isdisjoint(va_s)
+            assert tr_s.isdisjoint(te_s)
+            assert va_s.isdisjoint(te_s)
+
+            smap = meta["subject_id_map"]
+            assert smap is not None
+            assert {int(sid) for sid in smap.keys()} == tr_s
+            assert sorted(smap.values()) == list(range(len(tr_s)))
+            assert meta["n_train_subjects"] == len(tr_s)
+            fold_subject_maps.append(smap)
+
+            # Inference checkpoint strict load without subject_head
+            inf_state = torch.load(fdir / "model.pt", map_location="cpu", weights_only=True)
+            assert not any(key.startswith("subject_head.") for key in inf_state)
+            CDLMDDNet(n_channels=16, n_samples=64, n_classes=2).load_state_dict(
+                inf_state, strict=True
+            )
+
+            # Training checkpoint includes subject_head + resume metadata
+            ckpt = torch.load(fdir / TRAIN_CKPT_FILENAME, map_location="cpu", weights_only=True)
+            assert any(key.startswith("subject_head.") for key in ckpt["model_state_dict"])
+            assert ckpt["subject_id_map"] == smap
+            assert ckpt["n_subjects"] == len(tr_s)
+
+            with open(fdir / "preds.csv", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                assert reader.fieldnames == ["epoch_idx", "subject_id", "y_true", "p_mdd"]
+                for row in reader:
+                    seen_epochs.add(int(row["epoch_idx"]))
+                    assert int(row["subject_id"]) in te_s
+                    assert 0.0 <= float(row["p_mdd"]) <= 1.0
+
+        assert seen_epochs == set(range(40))
+        # Different folds hold out different participants so remappings differ cleanly per fold
+        assert fold_subject_maps[0] != fold_subject_maps[1]
+
+        # Synthetic LOSO with actual CDLMDDNet + DANN
+        data_loso = _make_synthetic_npz(
+            tmp_path / "modma_loso.npz",
+            n_mdd=3,
+            n_hc=3,
+            epochs_per_subj=4,
+            n_channels=16,
+            n_samples=64,
+            subject_offset=2020010,
+        )
+        cfg_loso = TrainConfig(
+            experiment="cdl_dann_loso",
+            model="src.models.cdl_mddnet:CDLMDDNet",
+            protocol="loso",
+            use_dann=True,
+            data_path=str(data_loso),
+            runs_dir=str(runs_dir),
+            val_fraction=0.25,
+            epochs=2,
+            batch_size=8,
+            device="cpu",
+            use_amp=False,
+        )
+        res_loso = run_experiment(cfg_loso, verbose=False)
+        assert len(res_loso["folds"]) == 6
+        for k, fold_meta in enumerate(res_loso["folds"]):
+            assert fold_meta["use_dann"] is True
+            assert len(fold_meta["test_subjects"]) == 1
+            assert set(int(s) for s in fold_meta["subject_id_map"].keys()) == set(
+                fold_meta["train_subjects"]
+            )
+            inf_state = torch.load(
+                runs_dir / "cdl_dann_loso" / f"fold_{k}" / "model.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            CDLMDDNet(n_channels=16, n_samples=64, n_classes=2).load_state_dict(
+                inf_state, strict=True
+            )
+
+    def test_dann_mid_fold_resume_and_never_uses_inference_checkpoint(self, tmp_path):
+        data_path = _make_synthetic_npz(
+            tmp_path / "dann_resume.npz",
+            n_mdd=4,
+            n_hc=4,
+            epochs_per_subj=4,
+            n_channels=16,
+            n_samples=64,
+            subject_offset=100,
+        )
+        with np.load(str(data_path)) as d:
+            X, y, sids = d["X"], d["y"], d["subject_id"]
+        tr, te = next(kfold_splits(sids, n_folds=4, seed=0, y=y))
+
+        cfg = TrainConfig(
+            experiment="dann_resume_exp",
+            model="src.models.cdl_mddnet:CDLMDDNet",
+            use_dann=True,
+            dann_gamma=10.0,
+            dann_loss_weight=1.0,
+            n_folds=4,
+            val_fraction=0.2,
+            epochs=4,
+            early_stopping_patience=4,
+            batch_size=8,
+            data_path=str(data_path),
+            runs_dir=str(tmp_path / "runs"),
+            device="cpu",
+            use_amp=False,
+        )
+
+        # Simulate interruption at end of epoch 2
+        fold0_dir = Path(cfg.runs_dir) / cfg.experiment / "fold_0"
+        (Path(cfg.runs_dir) / cfg.experiment).mkdir(parents=True, exist_ok=True)
+        # First create valid run_config.json via folds 1 only or test direct train_fold then runner
+        def _interrupt_ep2(info):
+            if info["epoch"] == 2:
+                raise RuntimeError("Simulated Colab GPU disconnect")
+
+        with pytest.raises(RuntimeError, match="Simulated Colab GPU disconnect"):
+            train_fold(0, X, y, sids, tr, te, cfg, fold0_dir, epoch_callback=_interrupt_ep2)
+
+        assert (fold0_dir / "model.pt").is_file()
+        assert (fold0_dir / TRAIN_CKPT_FILENAME).is_file()
+        assert not (fold0_dir / "preds.csv").exists()
+        assert not (fold0_dir / "fold_meta.json").exists()
+
+        ckpt_ep2 = torch.load(
+            fold0_dir / TRAIN_CKPT_FILENAME, map_location="cpu", weights_only=True
+        )
+        assert ckpt_ep2["epoch"] == 2
+        step_at_ep2 = ckpt_ep2["global_step"]
+        assert step_at_ep2 > 0
+        assert any(k.startswith("subject_head.") for k in ckpt_ep2["model_state_dict"])
+
+        # Refuse resuming from inference checkpoint if train_checkpoint.pt is missing
+        ckpt_backup = fold0_dir / "backup_train_ckpt.pt"
+        (fold0_dir / TRAIN_CKPT_FILENAME).replace(ckpt_backup)
+        with pytest.raises(FileNotFoundError, match="must not be used to resume training"):
+            train_fold(0, X, y, sids, tr, te, cfg, fold0_dir, resume=True)
+        ckpt_backup.replace(fold0_dir / TRAIN_CKPT_FILENAME)
+
+        # Refuse resuming DANN training checkpoint with ERM config
+        cfg_erm = TrainConfig(**{**cfg.to_dict(), "use_dann": False})
+        with pytest.raises(ValueError, match="cannot safely resume"):
+            train_fold(0, X, y, sids, tr, te, cfg_erm, fold0_dir, resume=True)
+
+        # Resume fold 0 from epoch 2 -> finishes epochs 3..4 cleanly without resetting global_step
+        resumed = train_fold(0, X, y, sids, tr, te, cfg, fold0_dir, resume=True)
+        assert resumed["epochs_ran"] == 4
+        assert resumed["global_step"] == step_at_ep2 * 2
+        with open(fold0_dir / "train_log.csv", newline="", encoding="utf-8") as f:
+            epochs_logged = [int(r["epoch"]) for r in csv.DictReader(f)]
+        assert epochs_logged == [1, 2, 3, 4]
+        assert (fold0_dir / "preds.csv").is_file()
+        assert (fold0_dir / "fold_meta.json").is_file()
+
+    def test_erm_no_dann_cli_and_no_mixing_between_dann_and_erm(self, tmp_path):
+        data_path = _make_synthetic_npz(
+            tmp_path / "erm_vs_dann.npz",
+            n_mdd=4,
+            n_hc=4,
+            epochs_per_subj=4,
+            n_channels=16,
+            n_samples=64,
+        )
+        runs_dir = tmp_path / "runs"
+
+        # CLI --no-dann without --experiment automatically isolates to runs/cdl_mddnet_erm/
+        runner_main([
+            "--model", "src.models.cdl_mddnet:CDLMDDNet",
+            "--no-dann",
+            "--data", str(data_path),
+            "--runs-dir", str(runs_dir),
+            "--n-folds", "4",
+            "--epochs", "2",
+            "--batch-size", "8",
+            "--device", "cpu",
+            "--no-amp",
+            "--quiet",
+        ])
+        erm_dir = runs_dir / "cdl_mddnet_erm"
+        assert (erm_dir / "run_config.json").is_file()
+        erm_fold0 = json.loads((erm_dir / "fold_0" / "fold_meta.json").read_text(encoding="utf-8"))
+        assert erm_fold0["use_dann"] is False
+        assert erm_fold0["subject_id_map"] is None
+
+        # Mixing DANN and ERM in the same experiment directory must fail on resume and overwrite
+        cfg_dann = TrainConfig(
+            experiment="mixed_guard",
+            model="src.models.cdl_mddnet:CDLMDDNet",
+            use_dann=True,
+            data_path=str(data_path),
+            runs_dir=str(runs_dir),
+            n_folds=4,
+            epochs=2,
+            batch_size=8,
+            device="cpu",
+            use_amp=False,
+        )
+        run_experiment(cfg_dann, fold_subset=["0"], verbose=False)
+
+        cfg_erm_same_dir = TrainConfig(**{**cfg_dann.to_dict(), "use_dann": False})
+        with pytest.raises(ValueError, match="configuration mismatch"):
+            run_experiment(cfg_erm_same_dir, fold_subset=["1"], resume=True, verbose=False)
+        with pytest.raises(ValueError, match="already contains DANN"):
+            run_experiment(cfg_erm_same_dir, verbose=False)

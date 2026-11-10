@@ -48,6 +48,9 @@ class TrainConfig:
     early_stopping_min_delta: float = 1e-4
     class_weighted_loss: bool = True
     grad_clip_norm: Optional[float] = 1.0
+    use_dann: bool = True
+    dann_gamma: float = 10.0
+    dann_loss_weight: float = 1.0
     use_amp: bool = True
     deterministic: bool = True
     device: str = "auto"
@@ -113,6 +116,24 @@ class TrainConfig:
         ):
             raise ValueError(
                 f"grad_clip_norm must be None or a finite float > 0, got {self.grad_clip_norm!r}."
+            )
+        if not isinstance(self.use_dann, bool):
+            raise ValueError(f"use_dann must be a boolean, got {self.use_dann!r}.")
+        if (
+            isinstance(self.dann_gamma, bool)
+            or not isinstance(self.dann_gamma, (int, float))
+            or not math.isfinite(self.dann_gamma)
+            or self.dann_gamma < 0
+        ):
+            raise ValueError(f"dann_gamma must be a finite float >= 0, got {self.dann_gamma!r}.")
+        if (
+            isinstance(self.dann_loss_weight, bool)
+            or not isinstance(self.dann_loss_weight, (int, float))
+            or not math.isfinite(self.dann_loss_weight)
+            or self.dann_loss_weight < 0
+        ):
+            raise ValueError(
+                f"dann_loss_weight must be a finite float >= 0, got {self.dann_loss_weight!r}."
             )
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
             raise ValueError(f"seed must be an integer >= 0, got {self.seed!r}.")
@@ -316,24 +337,39 @@ def build_model(
     n_channels: int,
     n_samples: int = 1000,
     n_classes: int = 2,
+    n_subjects: int = 0,
 ) -> nn.Module:
     """Instantiate a model conforming to the CDL-MDDNet interface contract.
 
     Expected interface:
     - Constructor: `ModelClass(n_channels, n_samples=1000, n_classes=2)`
+      (plus optional `n_subjects` and `forward_train(x, lambd)` for DANN)
     - Input tensor: `(batch_size, n_channels, n_samples)` (e.g. `(B, 128, 1000)`)
     - Output logits: `(batch_size, 2)` for labels `(batch_size,)` (`0=Healthy, 1=MDD`)
     """
     cls = load_model_class(model_spec)
     sig = inspect.signature(cls.__init__)
     params = sig.parameters
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     kwargs: Dict[str, Any] = {
         "n_channels": int(n_channels),
         "n_samples": int(n_samples),
     }
-    if "n_classes" in params or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-    ):
+    if "n_classes" in params or has_var_kw:
         kwargs["n_classes"] = int(n_classes)
-    return cls(**kwargs)
+    if int(n_subjects) > 0:
+        if "n_subjects" not in params and not has_var_kw:
+            raise ValueError(
+                f"DANN training requested (use_dann=True), but model '{model_spec}' "
+                f"constructor does not accept 'n_subjects'. Pass --no-dann (use_dann=False) for ERM."
+            )
+        kwargs["n_subjects"] = int(n_subjects)
+
+    model = cls(**kwargs)
+    if int(n_subjects) > 0 and not callable(getattr(model, "forward_train", None)):
+        raise ValueError(
+            f"DANN training requested (use_dann=True), but model '{model_spec}' "
+            f"does not implement callable `forward_train(x, lambd)`. Pass --no-dann (use_dann=False) for ERM."
+        )
+    return model
 

@@ -11,8 +11,8 @@ Examples
 Reduced montage from Member 5's channel_ranking.csv:
     python -m src.training.run_experiment --model src.models.cdl_mddnet:CDLMDDNet --channel-ranking channel_ranking.csv --top-k-channels 32 --experiment cdl_mddnet_ch32
 
-Pipeline smoke test before Member 1's model is ready:
-    python -m src.training.run_experiment --model dummy --protocol kfold10 --epochs 3
+Pipeline smoke test with Dummy ERM baseline:
+    python -m src.training.run_experiment --model dummy --no-dann --protocol kfold10 --epochs 3
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from src.training.config import (
     set_seed,
 )
 from src.training.splits import kfold_splits, loso_splits
-from src.training.trainer import train_fold
+from src.training.trainer import TRAIN_CKPT_FILENAME, train_fold
 
 
 PARAM_LIMIT = 100_000
@@ -214,6 +214,9 @@ COMPATIBLE_CONFIG_KEYS = (
     "early_stopping_min_delta",
     "class_weighted_loss",
     "grad_clip_norm",
+    "use_dann",
+    "dann_gamma",
+    "dann_loss_weight",
     "use_amp",
     "deterministic",
     "n_classes",
@@ -285,15 +288,26 @@ def run_experiment(
     device = resolve_device(cfg.device)
     hw = _hardware_info(device)
 
-    # Verify model instantiation and count trainable parameters once before training
+    # Verify model instantiation, DANN compatibility (if enabled), and inference parameter count
     probe_model = build_model(
         cfg.model,
         n_channels=int(X.shape[1]),
         n_samples=int(X.shape[2]),
         n_classes=int(cfg.n_classes),
+        n_subjects=0,
     )
     n_params = sum(p.numel() for p in probe_model.parameters() if p.requires_grad)
     del probe_model
+
+    if cfg.use_dann:
+        probe_dann = build_model(
+            cfg.model,
+            n_channels=int(X.shape[1]),
+            n_samples=int(X.shape[2]),
+            n_classes=int(cfg.n_classes),
+            n_subjects=2,
+        )
+        del probe_dann
 
     exp_dir = Path(cfg.runs_dir) / cfg.experiment
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -327,12 +341,22 @@ def run_experiment(
         if resume and not overwrite:
             _validate_resume_compatibility(existing_cfg, run_meta, exp_dir)
         elif not overwrite:
-            prev_proto = existing_cfg.get("config", {}).get("protocol")
+            prev_cfg = existing_cfg.get("config", {})
+            prev_proto = prev_cfg.get("protocol")
+            prev_dann = prev_cfg.get("use_dann")
             if prev_proto and prev_proto != cfg.protocol:
                 raise ValueError(
                     f"Experiment directory '{exp_dir}' already contains protocol '{prev_proto}', "
                     f"refusing to overwrite with '{cfg.protocol}'. Use a distinct --experiment name "
                     f"(e.g. '{cfg.experiment}_{cfg.protocol}') or pass --overwrite."
+                )
+            if prev_dann is not None and bool(prev_dann) != bool(cfg.use_dann):
+                prev_mode = "DANN" if prev_dann else "ERM"
+                curr_mode = "DANN" if cfg.use_dann else "ERM"
+                raise ValueError(
+                    f"Experiment directory '{exp_dir}' already contains {prev_mode} training, "
+                    f"refusing to overwrite with {curr_mode}. Use a distinct --experiment name "
+                    f"or pass --overwrite."
                 )
             run_cfg_path.write_text(json.dumps(run_meta, indent=2) + "\n", encoding="utf-8")
         else:
@@ -346,9 +370,10 @@ def run_experiment(
 
     if verbose:
         gpu_desc = f"{hw['gpu_name']} ({hw['gpu_vram_gb']} GB)" if "gpu_name" in hw else "CPU"
+        dann_desc = f"DANN(gamma={cfg.dann_gamma}, w={cfg.dann_loss_weight})" if cfg.use_dann else "ERM"
         print(
             f"[Experiment: {cfg.experiment}] protocol={cfg.protocol} ({len(folds)} folds) | "
-            f"model={cfg.model} ({n_params:,} params, under_100k={n_params < PARAM_LIMIT}) | "
+            f"mode={dann_desc} | model={cfg.model} ({n_params:,} inf params, under_100k={n_params < PARAM_LIMIT}) | "
             f"data={X.shape} | device={gpu_desc} | amp={cfg.use_amp and device.type == 'cuda'}"
         )
         if n_params >= PARAM_LIMIT:
@@ -363,6 +388,7 @@ def run_experiment(
         preds_file = fold_dir / "preds.csv"
         model_file = fold_dir / "model.pt"
         meta_file = fold_dir / "fold_meta.json"
+        train_ckpt_file = fold_dir / TRAIN_CKPT_FILENAME
 
         if resume and preds_file.is_file() and model_file.is_file() and meta_file.is_file():
             summary = json.loads(meta_file.read_text(encoding="utf-8"))
@@ -371,6 +397,7 @@ def run_experiment(
                 print(f"  [fold {k:>2}/{len(folds)-1}] skipped (--resume); test_acc={summary['test_acc']:.4f}")
             continue
 
+        resume_fold_ckpt = bool(resume and train_ckpt_file.is_file())
         summary = train_fold(
             fold_idx=k,
             X=X,
@@ -381,6 +408,7 @@ def run_experiment(
             cfg=cfg,
             output_dir=fold_dir,
             ch_names=selected_ch_names,
+            resume=resume_fold_ckpt,
         )
         summaries.append(summary)
         if verbose:
@@ -451,6 +479,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--num-workers", type=int, default=None)
     ap.add_argument("--no-amp", action="store_true", help="Disable CUDA automatic mixed precision.")
     ap.add_argument("--no-class-weights", action="store_true", help="Disable inverse-frequency class weights.")
+    dann_group = ap.add_mutually_exclusive_group()
+    dann_group.add_argument(
+        "--use-dann",
+        dest="use_dann",
+        action="store_true",
+        default=None,
+        help="Enable DANN subject-adversarial training (default for CDL-MDDNet).",
+    )
+    dann_group.add_argument(
+        "--no-dann",
+        dest="use_dann",
+        action="store_false",
+        default=None,
+        help="Disable DANN and run standard ERM classification baseline.",
+    )
+    ap.add_argument("--dann-gamma", type=float, default=None, help="Gamma for DANN lambda schedule (default: 10.0).")
+    ap.add_argument("--dann-weight", type=float, default=None, help="Weight on DANN subject loss (default: 1.0).")
     ap.add_argument("--channels", nargs="+", default=None, help="Channel names or indices to keep.")
     ap.add_argument("--channel-ranking", type=str, default=None, help="Path to channel_ranking.csv.")
     ap.add_argument("--top-k-channels", type=int, default=None, help="Top K channels from ranking CSV.")
@@ -503,6 +548,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cfg.use_amp = False
     if args.no_class_weights:
         cfg.class_weighted_loss = False
+    if args.use_dann is not None:
+        cfg.use_dann = args.use_dann
+    if args.dann_gamma is not None:
+        cfg.dann_gamma = args.dann_gamma
+    if args.dann_weight is not None:
+        cfg.dann_loss_weight = args.dann_weight
+    if (
+        args.experiment is None
+        and args.model != "dummy"
+        and not cfg.use_dann
+        and cfg.experiment == "cdl_mddnet"
+    ):
+        cfg.experiment = "cdl_mddnet_erm"
 
     run_experiment(
         cfg=cfg,
